@@ -6,7 +6,7 @@ select opname,
 round((sofar/TOTALWORK)*100,3) "%",
 time_remaining time,
 message
-from v$session_longops where 
+from gv$session_longops where 
 sofar <> TOTALWORK 
 and TOTALWORK <> 0
 order by 1;
