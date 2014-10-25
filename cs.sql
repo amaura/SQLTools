@@ -1,3 +1,4 @@
+-- s.sql List non background sessions
 set lines 200
 set pages 200
 
