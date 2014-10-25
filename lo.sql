@@ -1,4 +1,5 @@
 -- Session Long Operations
+-- lo.sql
 set pages 200 lines 200
 col opname format a30
 col message format a80
