@@ -1,0 +1,14 @@
+col username format a20
+col "PROGRAM" format a20
+col "MACHINE" format a20
+col "SERVICE" format a20
+alter session set nls_date_format='DD-MM-YY HH24:MI:SS';
+select
+inst_id,
+username,
+logon_time,
+status,
+substr(machine,0,20) "MACHINE",
+substr(program,0,20) "PROGRAM",
+substr(service_name,0,20) "SERVICE"
+from gv$session where type <> 'BACKGROUND' order by status;
