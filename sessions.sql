@@ -1,13 +1,13 @@
 set lines 200
 set pages 200
-col machine format a30
+col machine format a20
 col wait_class format a20
 select 
 inst_id,
 sid,
 serial#,
-program,
-machine,
+substr(machine,0,20) "MACHINE",
+substr(program,0,20) "PROGRAM",
 status,
 wait_class
 from gv$session
