@@ -2,11 +2,13 @@ set lines 200
 set pages 200
 col machine format a30
 col wait_class format a20
-select sid,
+select 
+inst_id,
+sid,
 serial#,
 program,
 machine,
 status,
 wait_class
-from v$session
+from gv$session
 where type <> 'BACKGROUND';
