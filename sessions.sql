@@ -1,6 +1,6 @@
 set lines 200
 set pages 200
-col inst_id format 99
+col inst_id format 9
 col machine format a20
 col program format a20
 col wait_class format a20
