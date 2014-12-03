@@ -1,6 +1,8 @@
 set lines 200
 set pages 200
+col inst_id format a3
 col machine format a20
+col program format a20
 col wait_class format a20
 select 
 inst_id,
