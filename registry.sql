@@ -2,7 +2,7 @@
 set pages 200
 set lines 200
 
-col comp_name format a50
+col comp_name format a45
 col version format a20
 col status format a10
 
