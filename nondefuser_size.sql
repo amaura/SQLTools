@@ -60,5 +60,8 @@ u.username not in
 'APPQOSSYS',
 'APEX_030200',
 'OWBSYS_AUDIT',
-'SCOTT')
+'SCOTT',
+'SYSTEM',
+'SYS',
+'TSMSYS')
 ;
