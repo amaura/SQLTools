@@ -29,4 +29,4 @@ to_char(sum(decode(to_char(first_time,'HH24'),'23',1,0)),'99') "23"
 from
    v$log_history
 GROUP by
-   to_char(first_time,'YYYY-MM-DD');
+   to_char(first_time,'YYYY-MM-DD') order by 1;
