@@ -1,7 +1,7 @@
 set lines 120;
 set pages 999;
 SELECT
-to_char(first_time,'YYYY-MON-DD') day,
+to_char(first_time,'YYYY-MM-DD') day,
 to_char(sum(decode(to_char(first_time,'HH24'),'00',1,0)),'99') "00",
 to_char(sum(decode(to_char(first_time,'HH24'),'01',1,0)),'99') "01",
 to_char(sum(decode(to_char(first_time,'HH24'),'02',1,0)),'99') "02",
@@ -29,4 +29,4 @@ to_char(sum(decode(to_char(first_time,'HH24'),'23',1,0)),'99') "23"
 from
    v$log_history
 GROUP by
-   to_char(first_time,'YYYY-MON-DD');
+   to_char(first_time,'YYYY-MM-DD');
