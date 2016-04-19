@@ -1,7 +1,7 @@
 -- Session Long Operations
 set pages 200 lines 200
 col opname format a30
-col message format a80
+col message format a90
 col "%" format 999.99
 SET UNDERLINE =
 select opname,
