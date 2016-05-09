@@ -1,3 +1,5 @@
+set lines 200
+set pages 200
 col username format a20
 col "PROGRAM" format a20
 col "MACHINE" format a20
@@ -11,4 +13,7 @@ status,
 substr(machine,0,20) "MACHINE",
 substr(program,0,20) "PROGRAM",
 substr(service_name,0,20) "SERVICE"
-from gv$session where type <> 'BACKGROUND' order by status;
+from gv$session where 
+type <> 'BACKGROUND' and
+status='ACTIVE'
+order by status;
