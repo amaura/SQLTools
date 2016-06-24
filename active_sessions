@@ -12,7 +12,8 @@ logon_time,
 status,
 substr(machine,0,20) "MACHINE",
 substr(program,0,20) "PROGRAM",
-substr(service_name,0,20) "SERVICE"
+substr(service_name,0,20) "SERVICE",
+WAIT_CLASS
 from gv$session where 
 type <> 'BACKGROUND' and
 status='ACTIVE'
