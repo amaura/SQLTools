@@ -4,6 +4,7 @@ col username format a20
 col "PROGRAM" format a20
 col "MACHINE" format a20
 col "SERVICE" format a20
+col event format a25
 alter session set nls_date_format='DD-MM-YY HH24:MI:SS';
 select
 inst_id,
