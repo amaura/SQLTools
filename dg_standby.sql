@@ -1,3 +1,4 @@
+set pages 50
 SELECT 
 PROCESS, 
 STATUS, 
