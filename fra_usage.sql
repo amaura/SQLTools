@@ -1,5 +1,4 @@
 set lines 200
-col 
 col "TOTAL GB" format 99999.9
 col "USED GB" format 99999.9
 col "RECLAIMABLE GB" format 99999.9
