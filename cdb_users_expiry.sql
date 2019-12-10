@@ -7,7 +7,6 @@ select p.NAME "PDB NAME",u.USERNAME,u.PROFILE,u.LOCK_DATE,u.EXPIRY_DATE
 from v$pdbs p, cdb_users u
 where 
 p.con_id=u.con_id
-and account_status='OPEN'
 and username not in 
 ('ANONYMOUS',
 'CTXSYS',
