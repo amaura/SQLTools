@@ -1,7 +1,7 @@
 set lines 200
 col username format a30
 col name format a20
-
+col profile format a30
 
 select p.NAME,u.USERNAME,u.PROFILE,u.LOCK_DATE,u.EXPIRY_DATE
 from v$pdbs p, cdb_users u
