@@ -2,7 +2,7 @@ set lines 200
 col "IN" format a10
 col "OUT" format a10
 col "DEV" format a4
-col "TIME" a10
+col "TIME" format a10
 select
 START_TIME,
 END_TIME,
