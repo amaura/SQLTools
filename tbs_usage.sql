@@ -4,10 +4,10 @@ set pause off
 set echo off
 set feedb on
 
-column "TOTAL ALLOC (MB)" format 9,999,990.00
-column "TOTAL PHYS ALLOC (MB)" format 9,999,990.00
-column "USED (MB)" format  9,999,990.00
-column "FREE (MB)" format 9,999,990.00
+column "TOTAL ALLOC (MB)" format 9,999,999,990.00
+column "TOTAL PHYS ALLOC (MB)" format 9,999,999,990.00
+column "USED (MB)" format  9,999,999,990.00
+column "FREE (MB)" format 9,999,999,990.00
 column "% USED" format 990.00
 
 select a.tablespace_name,
