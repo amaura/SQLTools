@@ -2,7 +2,7 @@ SET HEAD OFF
 SELECT 'Throughput: '||
        ROUND(SUM(v.value/1024/1024),1) || ' Meg so far @ ' ||
        ROUND(SUM(v.value     /1024/1024)/NVL((SELECT MIN(elapsed_seconds)
-            FROM v$session_longops
+            FROM gv$session_longops
             WHERE opname          LIKE 'RMAN: aggregate input'
               AND sofar           != TOTALWORK
               AND elapsed_seconds IS NOT NULL
