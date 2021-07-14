@@ -11,4 +11,4 @@ message
 from gv$session_longops where 
 sofar <> TOTALWORK 
 and TOTALWORK <> 0
-order by 1 desc;
+order by 1,2 desc;
