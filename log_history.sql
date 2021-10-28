@@ -1,4 +1,4 @@
-set lines 120;
+set lines 150;
 set pages 999;
 SELECT
 to_char(first_time,'YYYY-MM-DD') day,
