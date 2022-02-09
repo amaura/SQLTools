@@ -12,4 +12,5 @@ ARCHIVED_SEQ#,
 APPLIED_SEQ#,
 gap_status
 from gv$archive_dest_status
-where status <> 'INACTIVE';
+where status <> 'INACTIVE'
+order by 1,2;
