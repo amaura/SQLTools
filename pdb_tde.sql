@@ -1,4 +1,4 @@
-set lines 200
+set lines 200 pages 200
 col name format a20
 col key_id format a40
 col keystore_type format a30
