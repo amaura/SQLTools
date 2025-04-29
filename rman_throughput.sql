@@ -6,7 +6,7 @@ SELECT 'Throughput: '||
             WHERE opname          LIKE 'RMAN: aggregate input'
               AND sofar           != TOTALWORK
               AND elapsed_seconds IS NOT NULL
-       ),SUM(v.value     /1024/1024)),2) || ' Meg/sec'
+       ),SUM(v.value     /1024/1024)),2) || ' GB/sec'
  FROM gv$sesstat v, v$statname n, gv$session s
 WHERE v.statistic# = n.statistic#
   AND n.name       = 'physical write total bytes'
