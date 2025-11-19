@@ -25,8 +25,8 @@ from ( select tablespace_name,
        group by tablespace_name ) b
 where a.tablespace_name = b.tablespace_name (+)
 --and   (nvl(b.tot_used,0)/a.bytes_alloc)*100 > 10
-and   a.tablespace_name not in (select distinct tablespace_name from dba_temp_files)
-and   a.tablespace_name not like 'UNDO%'
+and   a.tablespace_name not in (select distinct tablespace_name from dba_temp_files)--
+--and   a.tablespace_name not like 'UNDO%'
 order by 1
 --order by 5
 /
