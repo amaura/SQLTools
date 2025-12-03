@@ -1,0 +1,4 @@
+alter system set "_client_enable_auto_unregister" = TRUE scope=spfile sid='*';
+alter system set "_emon_send_timeout" = 10000 scope=spfile sid='*';
+
+
