@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Oracle 19c non-CDB sequence comparison/alignment through an existing DB link.
+# Oracle 19c non-CDB target; Oracle 11.2.0.4/19c source through an existing DB link.
 # No NEXTVAL calls: all reported values are DBA_SEQUENCES.LAST_NUMBER.
 set -euo pipefail
 # Never trace the SQL*Plus login, even if invoked with bash -x.
@@ -31,7 +31,7 @@ Stop sequence consumers on BOTH databases, on ALL RAC instances, before -align.
 ALTER SEQUENCE commits; completed changes cannot be rolled back.
 
 Required reads: target DBA_USERS, DBA_SEQUENCES, DBA_OBJECTS, V_$DATABASE;
-source link account DBA_USERS and DBA_SEQUENCES. Alignment additionally needs
+source link account DBA_SEQUENCES (11.2.0.4 and 19c supported). Alignment needs
 ALTER on the target sequences or ALTER ANY SEQUENCE. Source sequence grants
 and SELECT ANY SEQUENCE are unnecessary because NEXTVAL is never called.
 
@@ -160,6 +160,27 @@ declare
     l_issues     pls_integer := 0;
     l_errors     pls_integer := 0;
 
+    function source_flag(p_column varchar2) return varchar2 is
+        l_probe number;
+    begin
+        -- p_column comes only from the three fixed calls below, never user input.
+        -- Probe one column at a time: 11g has none of these later feature flags.
+        -- A no-row query checks the identifier without reading sequence values.
+        execute immediate 'select count(q.' || p_column ||
+            ') from dba_sequences@' || c_link || ' q where 1 = 0' into l_probe;
+        return 'q.' || p_column;
+    exception
+        when others then
+            if sqlcode = -904 then
+                dbms_output.put_line('# Source compatibility: ' || p_column ||
+                    ' unavailable; using N');
+                return '''N''';
+            end if;
+            -- Privilege, connectivity, and other errors must not become a silent
+            -- fallback that could hide an incomplete or unreadable inventory.
+            raise;
+    end;
+
     function num(p_value number) return varchar2 is
     begin
         return to_char(p_value, 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,''');
@@ -211,7 +232,7 @@ declare
         if r.t_present is null then
             return 'No target sequence in a user with ORACLE_MAINTAINED=N; not created';
         elsif r.s_present is null then
-            return 'No source sequence in a user with ORACLE_MAINTAINED=N';
+            return 'No source sequence for an eligible target user';
         elsif r.t_session = 'Y' or r.s_session = 'Y' then
             return 'Session sequence: LAST_NUMBER is not meaningful';
         elsif r.t_scale = 'Y' or r.s_scale = 'Y'
@@ -286,18 +307,25 @@ begin
         raise_application_error(-20003, 'No visible database link named ' || c_link);
     end if;
 
-    -- Filter each side independently. FULL OUTER JOIN also exposes source-only
-    -- and target-only sequences instead of silently omitting missing objects.
-    -- Source DBA_* access is intentional: ALL_SEQUENCES could hide sequences.
+    -- The 19c target defines the eligible users for BOTH inventories. 11g has
+    -- no ORACLE_MAINTAINED column; never reference that column on the source.
+    -- FULL OUTER JOIN exposes source-only/target-only sequences within this
+    -- owner scope. DBA_SEQUENCES avoids ALL_SEQUENCES privilege filtering.
     l_sql := q'~
         select coalesce(t.sequence_owner, s.sequence_owner) owner_name,
                coalesce(t.sequence_name, s.sequence_name) sequence_name,
-               t.present, s.present, t.last_number, s.last_number,
-               t.increment_by, s.increment_by, t.min_value, s.min_value,
-               t.max_value, s.max_value, t.cache_size, s.cache_size,
-               t.cycle_flag, s.cycle_flag, t.scale_flag, s.scale_flag,
-               t.sharded_flag, s.sharded_flag, t.session_flag, s.session_flag,
-               t.generated, t.object_maintained, t.object_id, t.last_ddl_time
+               t.present t_present, s.present s_present,
+               t.last_number t_value, s.last_number s_value,
+               t.increment_by t_increment, s.increment_by s_increment,
+               t.min_value t_min, s.min_value s_min,
+               t.max_value t_max, s.max_value s_max,
+               t.cache_size t_cache, s.cache_size s_cache,
+               t.cycle_flag t_cycle, s.cycle_flag s_cycle,
+               t.scale_flag t_scale, s.scale_flag s_scale,
+               t.sharded_flag t_shard, s.sharded_flag s_shard,
+               t.session_flag t_session, s.session_flag s_session,
+               t.generated t_generated, t.object_maintained t_maintained,
+               t.object_id t_object_id, t.last_ddl_time t_last_ddl_time
           from (
               select q.*, 1 present, o.generated,
                      o.oracle_maintained object_maintained,
@@ -310,9 +338,13 @@ begin
                where u.oracle_maintained = 'N'
           ) t
           full outer join (
-              select q.*, 1 present
-                from dba_sequences@~' || c_link || q'~ q
-                join dba_users@~' || c_link || q'~ u on u.username = q.sequence_owner
+              select q.sequence_owner, q.sequence_name, q.last_number,
+                     q.increment_by, q.min_value, q.max_value, q.cache_size,
+                     q.cycle_flag, #SOURCE_SCALE_FLAG# scale_flag,
+                     #SOURCE_SHARDED_FLAG# sharded_flag,
+                     #SOURCE_SESSION_FLAG# session_flag, 1 present
+                from dba_sequences@#SOURCE_LINK# q
+                join dba_users u on u.username = q.sequence_owner
                where u.oracle_maintained = 'N'
           ) s on s.sequence_owner = t.sequence_owner
              and s.sequence_name = t.sequence_name
@@ -320,6 +352,11 @@ begin
 
     dbms_output.put_line('# Target: ' || sys_context('USERENV', 'DB_NAME') ||
         '; service: ' || sys_context('USERENV', 'SERVICE_NAME') || '; source link: ' || c_link);
+    dbms_output.put_line('# Owner scope on both sides: target DBA_USERS.ORACLE_MAINTAINED=N.');
+    l_sql := replace(l_sql, '#SOURCE_SCALE_FLAG#', source_flag('SCALE_FLAG'));
+    l_sql := replace(l_sql, '#SOURCE_SHARDED_FLAG#', source_flag('SHARDED_FLAG'));
+    l_sql := replace(l_sql, '#SOURCE_SESSION_FLAG#', source_flag('SESSION_FLAG'));
+    l_sql := replace(l_sql, '#SOURCE_LINK#', c_link);
     dbms_output.put_line('# Values are LAST_NUMBER cache boundaries, NOT last issued values.');
     dbms_output.put_line('# No NEXTVAL calls are made on either database.');
     dbms_output.put_line('# Status follows sequence direction; neither stored boundary is rewound.');
