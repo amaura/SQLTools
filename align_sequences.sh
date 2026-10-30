@@ -10,7 +10,7 @@ usage() {
 Usage:
   align_sequences.sh -host HOST -port PORT -service SERVICE -user USER \
                      -dblink SOURCE_LINK [-ignore-users USER1,USER2] \
-                     [-align [-output FILE]] [-sysdba]
+                     [-align] [-output FILE] [-sysdba]
 
   -host       Target database host/SCAN name, IPv4, or [IPv6] address.
   -port       Target listener port (1-65535).
@@ -19,15 +19,17 @@ Usage:
   -dblink     Existing private/public link from target to source, no leading @.
   -ignore-users  Comma-separated users to exclude in addition to default EXFSYS.
   -align      Report and generate ALTER SEQUENCE statements; never execute them.
-  -output     SQL output file for -align (default: timestamped file in this directory).
+  -output     Report or SQL output file (default: timestamped file in this directory).
   -sysdba     Connect AS SYSDBA (required when -user SYS).
   -help       Show this help. Double-dash forms are also accepted.
 
 Default: report only. Neither database's sequences are advanced by reporting.
 Values/statuses compare LAST_NUMBER (stored cache boundaries), NOT the last
 issued value. For descending sequences, lagging/ahead follow INCREMENT BY.
-Generate ALTER statements only for eligible lagging sequences, using the source
-boundary. Equal/ahead sequences are reported as unchanged; no ALTER is generated.
+Generate ALTER statements for eligible lagging non-cycling sequences and unequal
+cycling sequences, using the source boundary. Equal sequences and ahead non-cycling
+sequences remain unchanged. Cycling sequences must have matching definitions;
+unequal cycling positions have status different, not lagging/ahead.
 Other sequence settings are preserved.
 EXFSYS is always excluded. Additional ignored names use unquoted Oracle identifier
 syntax, are converted to uppercase, and may have spaces around the commas.
@@ -112,18 +114,19 @@ done
 if [[ $db_user =~ ^[sS][yY][sS]$ && $as_sysdba != Y ]]; then
     die 'Connecting as SYS requires -sysdba.'
 fi
-[[ -z $output_file || $do_align == Y ]] || die '-output requires -align.'
-if [[ $do_align == Y ]]; then
-    if [[ -z $output_file ]]; then
+if [[ -z $output_file ]]; then
+    if [[ $do_align == Y ]]; then
         output_file="sequence_alignment_$(date +%Y%m%d_%H%M%S)_$$.sql"
+    else
+        output_file="sequence_report_$(date +%Y%m%d_%H%M%S)_$$.txt"
     fi
-    [[ $output_file != *$'\n'* && $output_file != *$'\r'* ]] || die 'Output path contains a newline.'
-    [[ ! -e $output_file && ! -L $output_file ]] || die "Output already exists: $output_file"
-    output_parent=.
-    if [[ $output_file == */* ]]; then output_parent=${output_file%/*}; fi
-    [[ -n $output_parent ]] || output_parent=/
-    [[ -d $output_parent && -w $output_parent ]] || die "Output directory is not writable: $output_parent"
 fi
+[[ $output_file != *$'\n'* && $output_file != *$'\r'* ]] || die 'Output path contains a newline.'
+[[ ! -e $output_file && ! -L $output_file ]] || die "Output already exists: $output_file"
+output_parent=.
+if [[ $output_file == */* ]]; then output_parent=${output_file%/*}; fi
+[[ -n $output_parent ]] || output_parent=/
+[[ -d $output_parent && -w $output_parent ]] || die "Output directory is not writable: $output_parent"
 
 sqlplus_bin=
 if [[ -n ${ORACLE_HOME:-} && -x $ORACLE_HOME/bin/sqlplus ]]; then
@@ -352,11 +355,21 @@ column total_value new_value total_seq noprint
 column generated_value new_value generated_count noprint
 column unchanged_value new_value unchanged_count noprint
 column skipped_value new_value skipped_count noprint
+column lagging_value new_value lagging_count noprint
+column equal_value new_value equal_count noprint
+column ahead_value new_value ahead_count noprint
+column different_value new_value different_count noprint
+column other_value new_value other_count noprint
 column exit_value new_value final_exit noprint
 define total_seq = 0
 define generated_count = 0
 define unchanged_count = 0
 define skipped_count = 0
+define lagging_count = 0
+define equal_count = 0
+define ahead_count = 0
+define different_count = 0
+define other_count = 0
 define final_exit = 0
 spool &&run_dir/plan.sql
 select case when :generate_mode = 'Y'
@@ -375,7 +388,7 @@ select '-- ' || case when :generate_mode = 'Y' then
     'Stop consumers on BOTH databases / ALL RAC instances, regenerate a fresh plan, review, then execute manually on this target.'
     else 'Use -align [-output FILE] to generate SQL without executing it.' end output_line from dual;
 select '-- ' || case when :generate_mode = 'Y' then
-    'Only eligible lagging sequences get an ALTER; equal/ahead sequences remain unchanged.'
+    'Generate SQL for eligible lagging non-cycling or different cycling positions; equal positions remain unchanged.'
     else 'PHASE,OWNER,NAME,TARGET_LAST_NUMBER,SOURCE_LAST_NUMBER,TARGET_CACHE_SIZE,SOURCE_CACHE_SIZE,STATUS,DETAILS'
     end output_line from dual;
 select 'SET DEFINE OFF' || chr(10) || 'SET SQLBLANKLINES ON' || chr(10) ||
@@ -383,7 +396,9 @@ select 'SET DEFINE OFF' || chr(10) || 'SET SQLBLANKLINES ON' || chr(10) ||
        'WHENEVER SQLERROR EXIT 1 ROLLBACK' || chr(10) ||
        'WHENEVER OSERROR EXIT 1 ROLLBACK' output_line
   from dual where :generate_mode = 'Y';
-prompt -- Restart DDL commits individually; there is no batch rollback. Regenerate if the snapshot becomes stale.
+prompt -- Cycling positions use equal/different; lagging/ahead apply only to non-cycling sequences.
+select '-- Restart DDL commits individually; no batch rollback. Regenerate stale plans.' output_line
+  from dual where :generate_mode = 'Y';
 
 -- COMPARISON_BEGIN
 with target_rows as (
@@ -422,15 +437,17 @@ with target_rows as (
         on t.owner_name = s.owner_name and t.sequence_name = s.sequence_name
 ), classified as (
     select p.*,
-        case when t_increment > 0 then greatest(t_value, s_value)
+        case when t_cycle = 'Y' and s_cycle = 'Y' then s_value
+             when t_increment > 0 then greatest(t_value, s_value)
              else least(t_value, s_value) end restart_value,
         case when t_present is null then 'missing_target'
              when s_present is null then 'missing_source'
              when t_session = 'Y' or s_session = 'Y' or t_scale = 'Y' or s_scale = 'Y'
-               or t_shard = 'Y' or s_shard = 'Y' or t_cycle = 'Y' or s_cycle = 'Y' then 'unsupported'
-             when t_increment <> s_increment then 'incompatible'
+               or t_shard = 'Y' or s_shard = 'Y' then 'unsupported'
+             when t_increment <> s_increment or t_cycle <> s_cycle then 'incompatible'
              when t_value is null or s_value is null then 'unavailable'
              when t_value = s_value then 'equal'
+             when t_cycle = 'Y' and s_cycle = 'Y' then 'different'
              when (t_increment > 0 and t_value < s_value)
                or (t_increment < 0 and t_value > s_value) then 'lagging'
              else 'ahead' end status
@@ -442,7 +459,7 @@ with target_rows as (
              when t_session = 'Y' or s_session = 'Y' then 'Session sequence: LAST_NUMBER is not meaningful'
              when t_scale = 'Y' or s_scale = 'Y' or t_shard = 'Y' or s_shard = 'Y'
                   then 'Scalable/sharded sequence: not a comparable global counter'
-             when t_cycle = 'Y' or s_cycle = 'Y' then 'Cycling sequence: cycle position is unknown'
+             when t_cycle <> s_cycle then 'Different CYCLE/NOCYCLE definitions'
              when t_increment <> s_increment then 'Different INCREMENT BY definitions'
              when t_min <> s_min or t_max <> s_max then 'Different MINVALUE/MAXVALUE definitions'
              when t_generated = 'Y' then 'System-generated/identity sequence; cannot ALTER SEQUENCE'
@@ -471,8 +488,10 @@ select case when :generate_mode = 'Y' then
         '-- [' || seq_no || '/' || total || '] ' || display_name ||
         ' | target=' || target_text || ' | source=' || source_text || ' | status=' || status ||
         chr(10) || case when issue is not null then '-- SKIPPED: ' || issue
-            when status = 'lagging' then
-            '-- PLANNED: restart at ' || restart_text || ' (source boundary is farther along).' || chr(10) ||
+            when status in ('lagging', 'different') then
+            '-- PLANNED: restart at ' || restart_text || case status
+                when 'different' then ' (cycling sequence differs; use source stored boundary).'
+                else ' (source boundary is farther along).' end || chr(10) ||
             'PROMPT [' || seq_no || '/' || total || '] ' || display_name || ' -> restart at ' || restart_text || chr(10) ||
             'ALTER SEQUENCE ' || quoted_name || ' RESTART START WITH ' || restart_text || ';'
             else '-- UNCHANGED: ' || case status
@@ -485,16 +504,23 @@ select case when :generate_mode = 'Y' then
             to_char(t_cache, 'TM9') || ',' || to_char(s_cache, 'TM9') || ',"' || status || '","' || issue || '"',
             chr(13), '\r'), chr(10), '\n'), chr(9), '\t') end output_line,
        to_char(total, 'FM9999999990') total_value,
-       to_char(sum(case when :generate_mode = 'Y' and issue is null and status = 'lagging'
+       to_char(sum(case when :generate_mode = 'Y' and issue is null and status in ('lagging', 'different')
                        then 1 else 0 end) over (), 'FM9999999990') generated_value,
        to_char(sum(case when issue is null and status in ('equal', 'ahead')
                        then 1 else 0 end) over (), 'FM9999999990') unchanged_value,
        to_char(sum(case when issue is not null then 1 else 0 end) over (), 'FM9999999990') skipped_value,
+       to_char(sum(case when status = 'lagging' then 1 else 0 end) over (), 'FM9999999990') lagging_value,
+       to_char(sum(case when status = 'equal' then 1 else 0 end) over (), 'FM9999999990') equal_value,
+       to_char(sum(case when status = 'ahead' then 1 else 0 end) over (), 'FM9999999990') ahead_value,
+       to_char(sum(case when status = 'different' then 1 else 0 end) over (), 'FM9999999990') different_value,
+       to_char(sum(case when status not in ('lagging', 'equal', 'ahead', 'different')
+                       then 1 else 0 end) over (), 'FM9999999990') other_value,
        case when sum(case when issue is not null then 1 else 0 end) over () > 0 then '3' else '0' end exit_value
   from display_rows order by seq_no;
 -- COMPARISON_END
 
-prompt -- Summary: total=&total_seq, ALTER statements=&generated_count, unchanged=&unchanged_count, skipped/issues=&skipped_count.
+prompt -- Summary: total=&total_seq, lagging=&lagging_count, equal=&equal_count, ahead=&ahead_count, cycling_different=&different_count, other=&other_count.
+prompt -- Actions: ALTER statements=&generated_count, unchanged=&unchanged_count, skipped/issues=&skipped_count.
 prompt -- No ALTER statements were executed by this generator.
 prompt -- SEQUENCE REVIEW COMPLETE
 spool off
@@ -511,7 +537,7 @@ printf 'Ignored users (names are converted to uppercase): %s\n' "$ignored_users_
 if [[ $do_align == Y ]]; then
     printf 'Mode: GENERATE SQL ONLY. Planned output: %s\n' "$output_file"
 else
-    printf 'Mode: READ-ONLY REPORT.\n'
+    printf 'Mode: READ-ONLY REPORT. Planned output: %s\n' "$output_file"
 fi
 # No password in argv, environment, or temporary file. -L prevents login retries.
 # Do not use -S: keep SQL*Plus's native password prompt visible.
@@ -519,15 +545,19 @@ set +e
 "$sqlplus_bin" -L "$login" "@$run_dir/run.sql"
 sqlplus_status=$?
 set -e
-if [[ $do_align == Y && ( $sqlplus_status == 0 || $sqlplus_status == 3 ) ]]; then
+if [[ $sqlplus_status == 0 || $sqlplus_status == 3 ]]; then
     if [[ ! -f $run_dir/plan.sql ]] || ! grep -Fxq -- '-- SEQUENCE REVIEW COMPLETE' "$run_dir/plan.sql"; then
-        printf 'ERROR: SQL generation did not finish; no output file was published.\n' >&2
+        printf 'ERROR: Report/SQL generation did not finish; no output file was published.\n' >&2
         exit 1
     fi
     if (set -o noclobber; cat "$run_dir/plan.sql" > "$output_file"); then
-        printf '\nGenerated SQL: %s\nNo ALTER statements were executed.\n' "$output_file"
+        if [[ $do_align == Y ]]; then
+            printf '\nGenerated SQL: %s\nNo ALTER statements were executed.\n' "$output_file"
+        else
+            printf '\nReport saved: %s\n' "$output_file"
+        fi
         if [[ $sqlplus_status == 3 ]]; then
-            printf 'Some sequences were skipped; inspect their reasons in the generated file.\n' >&2
+            printf 'Some sequences were skipped or need attention; inspect the output file.\n' >&2
         fi
     else
         printf 'ERROR: Could not write output file: %s\n' "$output_file" >&2
