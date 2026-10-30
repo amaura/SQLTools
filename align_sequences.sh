@@ -9,13 +9,15 @@ usage() {
     cat <<'USAGE'
 Usage:
   align_sequences.sh -host HOST -port PORT -service SERVICE -user USER \
-                     -dblink SOURCE_LINK [-align [-output FILE]] [-sysdba]
+                     -dblink SOURCE_LINK [-ignore-users USER1,USER2] \
+                     [-align [-output FILE]] [-sysdba]
 
   -host       Target database host/SCAN name, IPv4, or [IPv6] address.
   -port       Target listener port (1-65535).
   -service    Target database service name.
   -user       Target login; SQL*Plus prompts for its password.
   -dblink     Existing private/public link from target to source, no leading @.
+  -ignore-users  Comma-separated users to exclude in addition to default EXFSYS.
   -align      Report and generate ALTER SEQUENCE statements; never execute them.
   -output     SQL output file for -align (default: timestamped file in this directory).
   -sysdba     Connect AS SYSDBA (required when -user SYS).
@@ -24,9 +26,11 @@ Usage:
 Default: report only. Neither database's sequences are advanced by reporting.
 Values/statuses compare LAST_NUMBER (stored cache boundaries), NOT the last
 issued value. For descending sequences, lagging/ahead follow INCREMENT BY.
-Generated statements restart each eligible target at the farther-along target/source
-boundary, even if equal/ahead, to discard potentially lower cached values.
-No boundary is rewound; other sequence settings are preserved.
+Generate ALTER statements only for eligible lagging sequences, using the source
+boundary. Equal/ahead sequences are reported as unchanged; no ALTER is generated.
+Other sequence settings are preserved.
+EXFSYS is always excluded. Additional ignored names use unquoted Oracle identifier
+syntax, are converted to uppercase, and may have spaces around the commas.
 
 Both modes only read metadata. Progress stages and query timings are displayed.
 Stop consumers on BOTH databases / ALL RAC instances before generating the final
@@ -46,6 +50,7 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 
 db_host='' db_port='' db_service='' db_user='' db_link=''
 output_file=''
+ignored_users_csv='EXFSYS'
 do_align=N
 as_sysdba=N
 while (($#)); do
@@ -53,7 +58,7 @@ while (($#)); do
         -help|--help|-h) usage; exit 0 ;;
         -align|--align) do_align=Y; shift ;;
         -sysdba|--sysdba) as_sysdba=Y; shift ;;
-        -host|--host|-port|--port|-service|--service|-user|--user|-dblink|--dblink|-output|--output)
+        -host|--host|-port|--port|-service|--service|-user|--user|-dblink|--dblink|-output|--output|-ignore-users|--ignore-users)
             (($# >= 2)) || die "Missing value for $1."
             [[ -n $2 && $2 != -* ]] || die "Missing value for $1."
             case "$1" in
@@ -63,6 +68,7 @@ while (($#)); do
                 -user|--user) db_user=$2 ;;
                 -dblink|--dblink) db_link=$2 ;;
                 -output|--output) output_file=$2 ;;
+                -ignore-users|--ignore-users) ignored_users_csv+=",$2" ;;
             esac
             shift 2
             ;;
@@ -87,6 +93,22 @@ db_port=$((10#$db_port))
     die 'Use an unquoted Oracle login name (up to 128 characters).'
 [[ $db_link =~ ^[a-zA-Z][a-zA-Z0-9_\$#]*(\.[a-zA-Z0-9_\$#]+)*$ &&
    ${#db_link} -le 128 ]] || die 'Invalid database link name (omit @ and quotes).'
+# Keep ignored names as separate validated literals, rather than interpolating
+# arbitrary CSV into a SQL predicate. One literal per SQL line also permits long
+# lists without exceeding SQL*Plus substitution/command-line lengths.
+[[ $ignored_users_csv != *$'\n'* && $ignored_users_csv != *$'\r'* &&
+   $ignored_users_csv != *, ]] || die 'Invalid ignored-user list: empty entry or newline.'
+IFS=',' read -r -a ignored_users <<< "$ignored_users_csv"
+ignored_users_csv=''
+for ignored_index in "${!ignored_users[@]}"; do
+    ignored_name=${ignored_users[ignored_index]}
+    ignored_name=${ignored_name#"${ignored_name%%[![:space:]]*}"}
+    ignored_name=${ignored_name%"${ignored_name##*[![:space:]]}"}
+    [[ $ignored_name =~ ^[a-zA-Z][a-zA-Z0-9_\$#]*$ && ${#ignored_name} -le 128 ]] ||
+        die 'Ignored users must be nonempty unquoted Oracle names (up to 128 characters).'
+    ignored_users[ignored_index]=$ignored_name
+    ignored_users_csv+="${ignored_users_csv:+,}$ignored_name"
+done
 if [[ $db_user =~ ^[sS][yY][sS]$ && $as_sysdba != Y ]]; then
     die 'Connecting as SYS requires -sysdba.'
 fi
@@ -139,6 +161,7 @@ whenever oserror exit 1 rollback
 whenever sqlerror exit 1 rollback
 variable generate_mode varchar2(1)
 variable owners_json clob
+variable ignored_users_json clob
 variable target_json clob
 variable source_json clob
 variable scale_expr varchar2(40)
@@ -150,8 +173,15 @@ declare
     l_cdb varchar2(3);
     l_links number;
     l_owners number;
+    l_ignored json_array_t := json_array_t();
     c_link constant varchar2(128) := upper('&&source_link');
 begin
+SQL
+for ignored_name in "${ignored_users[@]}"; do
+    printf "    l_ignored.append(upper('%s'));\n" "$ignored_name" >> "$run_dir/run.sql"
+done
+cat >> "$run_dir/run.sql" <<'SQL'
+    :ignored_users_json := l_ignored.to_clob();
     :generate_mode := '&&align_mode';
     if dbms_db_version.version <> 19 then
         raise_application_error(-20001, 'Target database must be Oracle 19c');
@@ -168,7 +198,12 @@ begin
     end if;
     select count(*), json_arrayagg(username order by username returning clob)
       into l_owners, :owners_json
-      from dba_users where oracle_maintained = 'N';
+      from dba_users where oracle_maintained = 'N'
+       and not exists (
+           select 1 from json_table(:ignored_users_json, '$[*]' columns (
+               username varchar2(128) path '$')) ignored
+            where ignored.username = dba_users.username
+       );
     if :owners_json is null then :owners_json := '[]'; end if;
     dbms_output.put_line('-- Target: ' || sys_context('USERENV', 'DB_NAME') ||
         '; service: ' || sys_context('USERENV', 'SERVICE_NAME') || '; source link: ' || c_link);
@@ -315,10 +350,12 @@ set timing off
 column output_line format a32767
 column total_value new_value total_seq noprint
 column generated_value new_value generated_count noprint
+column unchanged_value new_value unchanged_count noprint
 column skipped_value new_value skipped_count noprint
 column exit_value new_value final_exit noprint
 define total_seq = 0
 define generated_count = 0
+define unchanged_count = 0
 define skipped_count = 0
 define final_exit = 0
 spool &&run_dir/plan.sql
@@ -330,11 +367,15 @@ select '-- Target: ' || sys_context('USERENV', 'DB_NAME') || '; service: ' ||
     to_char(systimestamp, 'YYYY-MM-DD HH24:MI:SS TZH:TZM') output_line from dual;
 prompt -- Values are LAST_NUMBER cache boundaries, not last issued values.
 prompt -- Owner scope: target DBA_USERS.ORACLE_MAINTAINED=N; matching owner/name on source.
+select distinct '-- Ignored user: ' || username output_line
+  from json_table(:ignored_users_json, '$[*]' columns (
+      username varchar2(128) path '$'))
+ order by output_line;
 select '-- ' || case when :generate_mode = 'Y' then
     'Stop consumers on BOTH databases / ALL RAC instances, regenerate a fresh plan, review, then execute manually on this target.'
     else 'Use -align [-output FILE] to generate SQL without executing it.' end output_line from dual;
 select '-- ' || case when :generate_mode = 'Y' then
-    'Each eligible sequence gets a restart, including equal/ahead, to discard potentially lower unused cached values.'
+    'Only eligible lagging sequences get an ALTER; equal/ahead sequences remain unchanged.'
     else 'PHASE,OWNER,NAME,TARGET_LAST_NUMBER,SOURCE_LAST_NUMBER,TARGET_CACHE_SIZE,SOURCE_CACHE_SIZE,STATUS,DETAILS'
     end output_line from dual;
 select 'SET DEFINE OFF' || chr(10) || 'SET SQLBLANKLINES ON' || chr(10) ||
@@ -429,26 +470,31 @@ with target_rows as (
 select case when :generate_mode = 'Y' then
         '-- [' || seq_no || '/' || total || '] ' || display_name ||
         ' | target=' || target_text || ' | source=' || source_text || ' | status=' || status ||
-        chr(10) || case when issue is not null then '-- SKIPPED: ' || issue else
-            '-- PLANNED: restart at ' || restart_text || case status
-                when 'lagging' then ' (source boundary is farther along).'
-                when 'ahead' then ' (keep target boundary and discard unused cached values).'
-                else ' (equal stored boundaries; discard unused cached values).' end || chr(10) ||
+        chr(10) || case when issue is not null then '-- SKIPPED: ' || issue
+            when status = 'lagging' then
+            '-- PLANNED: restart at ' || restart_text || ' (source boundary is farther along).' || chr(10) ||
             'PROMPT [' || seq_no || '/' || total || '] ' || display_name || ' -> restart at ' || restart_text || chr(10) ||
-            'ALTER SEQUENCE ' || quoted_name || ' RESTART START WITH ' || restart_text || ';' end
+            'ALTER SEQUENCE ' || quoted_name || ' RESTART START WITH ' || restart_text || ';'
+            else '-- UNCHANGED: ' || case status
+                when 'equal' then 'stored boundaries are equal; no ALTER is necessary.'
+                when 'ahead' then 'target is ahead of source; no ALTER is necessary.'
+                else 'no alignment required.' end end
        else replace(replace(replace(
             'REPORT,"' || replace(owner_name, '"', '""') || '","' ||
             replace(sequence_name, '"', '""') || '",' || target_text || ',' || source_text || ',' ||
             to_char(t_cache, 'TM9') || ',' || to_char(s_cache, 'TM9') || ',"' || status || '","' || issue || '"',
             chr(13), '\r'), chr(10), '\n'), chr(9), '\t') end output_line,
        to_char(total, 'FM9999999990') total_value,
-       to_char(sum(case when :generate_mode = 'Y' and issue is null then 1 else 0 end) over (), 'FM9999999990') generated_value,
+       to_char(sum(case when :generate_mode = 'Y' and issue is null and status = 'lagging'
+                       then 1 else 0 end) over (), 'FM9999999990') generated_value,
+       to_char(sum(case when issue is null and status in ('equal', 'ahead')
+                       then 1 else 0 end) over (), 'FM9999999990') unchanged_value,
        to_char(sum(case when issue is not null then 1 else 0 end) over (), 'FM9999999990') skipped_value,
        case when sum(case when issue is not null then 1 else 0 end) over () > 0 then '3' else '0' end exit_value
   from display_rows order by seq_no;
 -- COMPARISON_END
 
-prompt -- Summary: total=&total_seq, ALTER statements=&generated_count, skipped/issues=&skipped_count.
+prompt -- Summary: total=&total_seq, ALTER statements=&generated_count, unchanged=&unchanged_count, skipped/issues=&skipped_count.
 prompt -- No ALTER statements were executed by this generator.
 prompt -- SEQUENCE REVIEW COMPLETE
 spool off
@@ -461,6 +507,7 @@ if [[ $as_sysdba == Y ]]; then
 fi
 printf 'Connecting to %s:%s/%s as %s; enter the password at the SQL*Plus prompt.\n' \
     "$db_host" "$db_port" "$db_service" "$db_user"
+printf 'Ignored users (names are converted to uppercase): %s\n' "$ignored_users_csv"
 if [[ $do_align == Y ]]; then
     printf 'Mode: GENERATE SQL ONLY. Planned output: %s\n' "$output_file"
 else
