@@ -9,33 +9,35 @@ usage() {
     cat <<'USAGE'
 Usage:
   align_sequences.sh -host HOST -port PORT -service SERVICE -user USER \
-                     -dblink SOURCE_LINK [-align] [-sysdba]
+                     -dblink SOURCE_LINK [-align [-output FILE]] [-sysdba]
 
   -host       Target database host/SCAN name, IPv4, or [IPv6] address.
   -port       Target listener port (1-65535).
   -service    Target database service name.
   -user       Target login; SQL*Plus prompts for its password.
   -dblink     Existing private/public link from target to source, no leading @.
-  -align      Report BEFORE, advance eligible target sequences, report AFTER.
+  -align      Report and generate ALTER SEQUENCE statements; never execute them.
+  -output     SQL output file for -align (default: timestamped file in this directory).
   -sysdba     Connect AS SYSDBA (required when -user SYS).
   -help       Show this help. Double-dash forms are also accepted.
 
 Default: report only. Neither database's sequences are advanced by reporting.
 Values/statuses compare LAST_NUMBER (stored cache boundaries), NOT the last
 issued value. For descending sequences, lagging/ahead follow INCREMENT BY.
-Alignment restarts each eligible target at the farther-along target/source
+Generated statements restart each eligible target at the farther-along target/source
 boundary, even if equal/ahead, to discard potentially lower cached values.
 No boundary is rewound; other sequence settings are preserved.
 
-Stop sequence consumers on BOTH databases, on ALL RAC instances, before -align.
-ALTER SEQUENCE commits; completed changes cannot be rolled back.
+Both modes only read metadata. Progress stages and query timings are displayed.
+Stop consumers on BOTH databases / ALL RAC instances before generating the final
+plan and manually executing it. Regenerate stale plans. ALTER SEQUENCE commits.
 
 Required reads: target DBA_USERS, DBA_SEQUENCES, DBA_OBJECTS, V_$DATABASE;
-source link account DBA_SEQUENCES (11.2.0.4 and 19c supported). Alignment needs
-ALTER on the target sequences or ALTER ANY SEQUENCE. Source sequence grants
-and SELECT ANY SEQUENCE are unnecessary because NEXTVAL is never called.
+source link account DBA_SEQUENCES (11.2.0.4 and 19c supported). No ALTER privilege
+is needed to generate SQL. Manual execution needs ALTER on the target sequences
+or ALTER ANY SEQUENCE. NEXTVAL is never called.
 
-Exit: 0 = report/alignment complete; 1 = database/OS error;
+Exit: 0 = report/generation complete; 1 = database/OS error;
       2 = usage/environment error; 3 = missing/unsupported/unresolved sequence.
 USAGE
 }
@@ -43,6 +45,7 @@ USAGE
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 
 db_host='' db_port='' db_service='' db_user='' db_link=''
+output_file=''
 do_align=N
 as_sysdba=N
 while (($#)); do
@@ -50,7 +53,7 @@ while (($#)); do
         -help|--help|-h) usage; exit 0 ;;
         -align|--align) do_align=Y; shift ;;
         -sysdba|--sysdba) as_sysdba=Y; shift ;;
-        -host|--host|-port|--port|-service|--service|-user|--user|-dblink|--dblink)
+        -host|--host|-port|--port|-service|--service|-user|--user|-dblink|--dblink|-output|--output)
             (($# >= 2)) || die "Missing value for $1."
             [[ -n $2 && $2 != -* ]] || die "Missing value for $1."
             case "$1" in
@@ -59,6 +62,7 @@ while (($#)); do
                 -service|--service) db_service=$2 ;;
                 -user|--user) db_user=$2 ;;
                 -dblink|--dblink) db_link=$2 ;;
+                -output|--output) output_file=$2 ;;
             esac
             shift 2
             ;;
@@ -86,6 +90,18 @@ db_port=$((10#$db_port))
 if [[ $db_user =~ ^[sS][yY][sS]$ && $as_sysdba != Y ]]; then
     die 'Connecting as SYS requires -sysdba.'
 fi
+[[ -z $output_file || $do_align == Y ]] || die '-output requires -align.'
+if [[ $do_align == Y ]]; then
+    if [[ -z $output_file ]]; then
+        output_file="sequence_alignment_$(date +%Y%m%d_%H%M%S)_$$.sql"
+    fi
+    [[ $output_file != *$'\n'* && $output_file != *$'\r'* ]] || die 'Output path contains a newline.'
+    [[ ! -e $output_file && ! -L $output_file ]] || die "Output already exists: $output_file"
+    output_parent=.
+    if [[ $output_file == */* ]]; then output_parent=${output_file%/*}; fi
+    [[ -n $output_parent ]] || output_parent=/
+    [[ -d $output_parent && -w $output_parent ]] || die "Output directory is not writable: $output_parent"
+fi
 
 sqlplus_bin=
 if [[ -n ${ORACLE_HOME:-} && -x $ORACLE_HOME/bin/sqlplus ]]; then
@@ -112,185 +128,31 @@ trap 'exit 143' TERM
 
 # Arguments are already restricted above; these are the only shell substitutions
 # written to SQL. Credentials are handled by SQL*Plus itself and never stored.
-printf "define source_link = '%s'\ndefine align_mode = '%s'\n" \
-    "$db_link" "$do_align" > "$run_dir/run.sql"
+printf "define source_link = '%s'\ndefine align_mode = '%s'\ndefine run_dir = '%s'\n" \
+    "$db_link" "$do_align" "$run_dir" > "$run_dir/run.sql"
 cat >> "$run_dir/run.sql" <<'SQL'
 set termout on echo off verify off feedback off heading off pagesize 0
-set linesize 32767 trimout on trimspool on tab off
+set linesize 32767 trimout on trimspool on tab off recsep off
 set serveroutput on size unlimited format wrapped
-set define on
+set arraysize 500 timing on define on
 whenever oserror exit 1 rollback
 whenever sqlerror exit 1 rollback
-variable run_exit number
+variable generate_mode varchar2(1)
+variable owners_json clob
+variable target_json clob
+variable source_json clob
+variable scale_expr varchar2(40)
+variable shard_expr varchar2(40)
+variable session_expr varchar2(40)
 
+prompt -- [1/5] Validate target/link and read eligible target users.
 declare
-    c_link  constant varchar2(128) := upper('&&source_link');
-    c_align constant boolean := '&&align_mode' = 'Y';
-
-    type seq_row is record (
-        owner_name      varchar2(128),
-        sequence_name   varchar2(128),
-        t_present       number,         s_present       number,
-        t_value         number,         s_value         number,
-        t_increment     number,         s_increment     number,
-        t_min           number,         s_min           number,
-        t_max           number,         s_max           number,
-        t_cache         number,         s_cache         number,
-        t_cycle         varchar2(1),    s_cycle         varchar2(1),
-        t_scale         varchar2(1),    s_scale         varchar2(1),
-        t_shard         varchar2(1),    s_shard         varchar2(1),
-        t_session       varchar2(1),    s_session       varchar2(1),
-        t_generated     varchar2(1),
-        t_maintained    varchar2(1),
-        t_object_id     number,
-        t_last_ddl_time date
-    );
-    type seq_rows is table of seq_row;
-    l_before seq_rows;
-    l_after  seq_rows;
-    l_now    seq_row;
-    l_sql    varchar2(32767);
-    l_stmt   varchar2(1000);
-    l_cdb    varchar2(3);
-    l_status varchar2(30);
-    l_reason varchar2(1000);
-    l_restart number;
-    l_link_count pls_integer;
-    l_changed    pls_integer := 0;
-    l_issues     pls_integer := 0;
-    l_errors     pls_integer := 0;
-
-    function source_flag(p_column varchar2) return varchar2 is
-        l_probe number;
-    begin
-        -- p_column comes only from the three fixed calls below, never user input.
-        -- Probe one column at a time: 11g has none of these later feature flags.
-        -- A no-row query checks the identifier without reading sequence values.
-        execute immediate 'select count(q.' || p_column ||
-            ') from dba_sequences@' || c_link || ' q where 1 = 0' into l_probe;
-        return 'q.' || p_column;
-    exception
-        when others then
-            if sqlcode = -904 then
-                dbms_output.put_line('# Source compatibility: ' || p_column ||
-                    ' unavailable; using N');
-                return '''N''';
-            end if;
-            -- Privilege, connectivity, and other errors must not become a silent
-            -- fallback that could hide an incomplete or unreadable inventory.
-            raise;
-    end;
-
-    function num(p_value number) return varchar2 is
-    begin
-        return to_char(p_value, 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,''');
-    end;
-
-    function csv(p_value varchar2) return varchar2 is
-    begin
-        -- Keep each record on one output line, even for unusual quoted names.
-        return '"' || replace(replace(replace(replace(
-            p_value, '"', '""'), chr(13), '\r'), chr(10), '\n'), chr(9), '\t') || '"';
-    end;
-
-    function quoted(p_name varchar2) return varchar2 is
-    begin
-        return '"' || replace(p_name, '"', '""') || '"';
-    end;
-
-    function status_of(r seq_row) return varchar2 is
-    begin
-        if r.t_present is null then return 'missing_target'; end if;
-        if r.s_present is null then return 'missing_source'; end if;
-        if r.t_session = 'Y' or r.s_session = 'Y'
-           or r.t_scale = 'Y' or r.s_scale = 'Y'
-           or r.t_shard = 'Y' or r.s_shard = 'Y'
-           or r.t_cycle = 'Y' or r.s_cycle = 'Y' then
-            return 'unsupported';
-        end if;
-        if r.t_increment <> r.s_increment then return 'incompatible'; end if;
-        if r.t_value is null or r.s_value is null then return 'unavailable'; end if;
-        if r.t_value = r.s_value then return 'equal'; end if;
-        if (r.t_increment > 0 and r.t_value < r.s_value)
-           or (r.t_increment < 0 and r.t_value > r.s_value) then
-            return 'lagging';
-        end if;
-        return 'ahead';
-    end;
-
-    function restart_at(r seq_row) return number is
-    begin
-        if r.t_increment > 0 then
-            return greatest(r.t_value, r.s_value);
-        else
-            return least(r.t_value, r.s_value);
-        end if;
-    end;
-
-    function alignment_issue(r seq_row) return varchar2 is
-    begin
-        if r.t_present is null then
-            return 'No target sequence in a user with ORACLE_MAINTAINED=N; not created';
-        elsif r.s_present is null then
-            return 'No source sequence for an eligible target user';
-        elsif r.t_session = 'Y' or r.s_session = 'Y' then
-            return 'Session sequence: LAST_NUMBER is not meaningful';
-        elsif r.t_scale = 'Y' or r.s_scale = 'Y'
-           or r.t_shard = 'Y' or r.s_shard = 'Y' then
-            return 'Scalable/sharded sequence: not a comparable global counter';
-        elsif r.t_cycle = 'Y' or r.s_cycle = 'Y' then
-            return 'Cycling sequence: lagging/ahead cannot establish cycle position';
-        elsif r.t_increment <> r.s_increment then
-            return 'Different INCREMENT BY definitions; not altered';
-        elsif r.t_min <> r.s_min or r.t_max <> r.s_max then
-            return 'Different MINVALUE/MAXVALUE definitions; not altered';
-        elsif r.t_generated = 'Y' then
-            return 'System-generated/identity sequence; cannot ALTER SEQUENCE';
-        elsif r.t_maintained = 'Y' then
-            return 'Oracle-maintained object; not altered';
-        elsif r.t_object_id is null then
-            return 'Target object metadata unavailable; not altered';
-        elsif r.t_value is null or r.s_value is null then
-            return 'LAST_NUMBER unavailable; not altered';
-        elsif restart_at(r) < r.t_min or restart_at(r) > r.t_max then
-            return 'Restart boundary outside sequence bounds (possibly exhausted)';
-        end if;
-        return null;
-    end;
-
-    procedure emit_row(p_phase varchar2, r seq_row, p_details varchar2) is
-    begin
-        dbms_output.put_line(csv(p_phase) || ',' || csv(r.owner_name) || ',' ||
-            csv(r.sequence_name) || ',' || num(r.t_value) || ',' || num(r.s_value) || ',' ||
-            num(r.t_cache) || ',' || num(r.s_cache) || ',' ||
-            csv(status_of(r)) || ',' || csv(p_details));
-    end;
-
-    procedure report(p_phase varchar2, p_rows seq_rows) is
-        l_lagging pls_integer := 0;
-        l_equal   pls_integer := 0;
-        l_ahead   pls_integer := 0;
-        l_other   pls_integer := 0;
-    begin
-        dbms_output.put_line('# ' || p_phase);
-        dbms_output.put_line('PHASE,OWNER,NAME,TARGET_LAST_NUMBER,SOURCE_LAST_NUMBER,' ||
-                             'TARGET_CACHE_SIZE,SOURCE_CACHE_SIZE,STATUS,DETAILS');
-        for i in 1 .. p_rows.count loop
-            emit_row(p_phase, p_rows(i), alignment_issue(p_rows(i)));
-            case status_of(p_rows(i))
-                when 'lagging' then l_lagging := l_lagging + 1;
-                when 'equal'   then l_equal   := l_equal + 1;
-                when 'ahead'   then l_ahead   := l_ahead + 1;
-                else l_other := l_other + 1;
-            end case;
-        end loop;
-        dbms_output.put_line('# ' || p_phase || ': total=' || p_rows.count ||
-            ', lagging=' || l_lagging || ', equal=' || l_equal ||
-            ', ahead=' || l_ahead || ', other=' || l_other);
-    end;
-
+    l_cdb varchar2(3);
+    l_links number;
+    l_owners number;
+    c_link constant varchar2(128) := upper('&&source_link');
 begin
-    :run_exit := 0;
+    :generate_mode := '&&align_mode';
     if dbms_db_version.version <> 19 then
         raise_application_error(-20001, 'Target database must be Oracle 19c');
     end if;
@@ -298,145 +160,299 @@ begin
     if l_cdb <> 'NO' then
         raise_application_error(-20002, 'Target must be a non-CDB database');
     end if;
-    select count(*) into l_link_count
-      from all_db_links
+    select count(*) into l_links from all_db_links
      where db_link = c_link
         or substr(db_link, 1, length(c_link) + 1) = c_link || '.';
-    -- A short DB link name may be expanded by Oracle with the local DB domain.
-    if l_link_count = 0 then
+    if l_links = 0 then
         raise_application_error(-20003, 'No visible database link named ' || c_link);
     end if;
-
-    -- The 19c target defines the eligible users for BOTH inventories. 11g has
-    -- no ORACLE_MAINTAINED column; never reference that column on the source.
-    -- FULL OUTER JOIN exposes source-only/target-only sequences within this
-    -- owner scope. DBA_SEQUENCES avoids ALL_SEQUENCES privilege filtering.
-    l_sql := q'~
-        select coalesce(t.sequence_owner, s.sequence_owner) owner_name,
-               coalesce(t.sequence_name, s.sequence_name) sequence_name,
-               t.present t_present, s.present s_present,
-               t.last_number t_value, s.last_number s_value,
-               t.increment_by t_increment, s.increment_by s_increment,
-               t.min_value t_min, s.min_value s_min,
-               t.max_value t_max, s.max_value s_max,
-               t.cache_size t_cache, s.cache_size s_cache,
-               t.cycle_flag t_cycle, s.cycle_flag s_cycle,
-               t.scale_flag t_scale, s.scale_flag s_scale,
-               t.sharded_flag t_shard, s.sharded_flag s_shard,
-               t.session_flag t_session, s.session_flag s_session,
-               t.generated t_generated, t.object_maintained t_maintained,
-               t.object_id t_object_id, t.last_ddl_time t_last_ddl_time
-          from (
-              select q.*, 1 present, o.generated,
-                     o.oracle_maintained object_maintained,
-                     o.object_id, o.last_ddl_time
-                from dba_sequences q
-                join dba_users u on u.username = q.sequence_owner
-                left join dba_objects o
-                  on o.owner = q.sequence_owner and o.object_name = q.sequence_name
-                 and o.object_type = 'SEQUENCE' and o.subobject_name is null
-               where u.oracle_maintained = 'N'
-          ) t
-          full outer join (
-              select q.sequence_owner, q.sequence_name, q.last_number,
-                     q.increment_by, q.min_value, q.max_value, q.cache_size,
-                     q.cycle_flag, #SOURCE_SCALE_FLAG# scale_flag,
-                     #SOURCE_SHARDED_FLAG# sharded_flag,
-                     #SOURCE_SESSION_FLAG# session_flag, 1 present
-                from dba_sequences@#SOURCE_LINK# q
-                join dba_users u on u.username = q.sequence_owner
-               where u.oracle_maintained = 'N'
-          ) s on s.sequence_owner = t.sequence_owner
-             and s.sequence_name = t.sequence_name
-    ~';
-
-    dbms_output.put_line('# Target: ' || sys_context('USERENV', 'DB_NAME') ||
+    select count(*), json_arrayagg(username order by username returning clob)
+      into l_owners, :owners_json
+      from dba_users where oracle_maintained = 'N';
+    if :owners_json is null then :owners_json := '[]'; end if;
+    dbms_output.put_line('-- Target: ' || sys_context('USERENV', 'DB_NAME') ||
         '; service: ' || sys_context('USERENV', 'SERVICE_NAME') || '; source link: ' || c_link);
-    dbms_output.put_line('# Owner scope on both sides: target DBA_USERS.ORACLE_MAINTAINED=N.');
-    l_sql := replace(l_sql, '#SOURCE_SCALE_FLAG#', source_flag('SCALE_FLAG'));
-    l_sql := replace(l_sql, '#SOURCE_SHARDED_FLAG#', source_flag('SHARDED_FLAG'));
-    l_sql := replace(l_sql, '#SOURCE_SESSION_FLAG#', source_flag('SESSION_FLAG'));
-    l_sql := replace(l_sql, '#SOURCE_LINK#', c_link);
-    dbms_output.put_line('# Values are LAST_NUMBER cache boundaries, NOT last issued values.');
-    dbms_output.put_line('# No NEXTVAL calls are made on either database.');
-    dbms_output.put_line('# Status follows sequence direction; neither stored boundary is rewound.');
-    execute immediate l_sql || ' order by 1, 2' bulk collect into l_before;
-    if c_align then
-        dbms_output.put_line('# ALIGN: consumers must be stopped on BOTH databases / ALL RAC instances.');
-        dbms_output.put_line('# ALTER SEQUENCE commits; there is no batch rollback.');
-        report('BEFORE', l_before);
-        dbms_output.put_line('# ACTIONS (same CSV columns)');
-
-        for i in 1 .. l_before.count loop
-            l_reason := alignment_issue(l_before(i));
-            if l_reason is not null then
-                l_issues := l_issues + 1;
-                emit_row('ACTION', l_before(i), 'SKIPPED: ' || l_reason);
-            else
-                begin
-                    -- Close the bulk-report cursor before DDL, and re-read both
-                    -- boundaries and the target definition immediately before it.
-                    execute immediate 'select * from (' || l_sql ||
-                        ') where owner_name = :owner_name and sequence_name = :seq_name'
-                        into l_now using l_before(i).owner_name, l_before(i).sequence_name;
-                    if l_now.t_object_id <> l_before(i).t_object_id
-                       or l_now.t_last_ddl_time <> l_before(i).t_last_ddl_time
-                       or l_now.t_value <> l_before(i).t_value
-                       or l_now.s_value <> l_before(i).s_value
-                       or alignment_issue(l_now) is not null then
-                        l_issues := l_issues + 1;
-                        emit_row('ACTION', l_now, 'SKIPPED: metadata/state changed since BEFORE');
-                    else
-                        -- Even an equal/ahead stored boundary can hide smaller
-                        -- unused cached values. Restart at the farther boundary
-                        -- to invalidate those ranges without rewinding either side.
-                        l_restart := restart_at(l_now);
-                        l_stmt := 'alter sequence ' || quoted(l_now.owner_name) || '.' ||
-                            quoted(l_now.sequence_name) || ' restart start with ' || num(l_restart);
-                        execute immediate l_stmt;
-                        l_changed := l_changed + 1;
-                        emit_row('ACTION', l_now, 'RESTARTED: next target value set to ' ||
-                            num(l_restart) || '; verify in AFTER');
-                    end if;
-                exception
-                    when others then
-                        l_errors := l_errors + 1;
-                        emit_row('ACTION', l_before(i), 'ERROR: ' || sqlerrm);
-                end;
-            end if;
-        end loop;
-
-        execute immediate l_sql || ' order by 1, 2' bulk collect into l_after;
-        report('AFTER', l_after);
-    else
-        report('REPORT', l_before);
-        l_after := l_before;
-    end if;
-
-    -- Report unresolved states even if there were no eligible ALTER statements.
-    -- In align mode, unsupported objects cannot have their cached ranges flushed.
-    for i in 1 .. l_after.count loop
-        l_status := status_of(l_after(i));
-        if l_status not in ('lagging', 'equal', 'ahead')
-           or alignment_issue(l_after(i)) is not null
-           or (c_align and l_status = 'lagging') then
-            l_issues := l_issues + 1;
-        end if;
-    end loop;
-    if l_errors > 0 then
-        :run_exit := 1;
-    elsif l_issues > 0 then
-        :run_exit := 3;
-    end if;
-    dbms_output.put_line('# Completed: altered=' || l_changed ||
-        ', errors=' || l_errors || ', exit=' || :run_exit);
-exception
-    when others then
-        dbms_output.put_line('# FATAL: ' || sqlerrm);
-        raise;
+    dbms_output.put_line('-- Eligible target users: ' || l_owners);
+    dbms_output.put_line('-- READ ONLY: no sequence values or definitions will be changed.');
 end;
 /
-exit :run_exit rollback
+
+prompt -- [2/5] Read target sequence metadata once (local query).
+declare
+    l_rows number;
+begin
+    -- TARGET_INVENTORY_BEGIN
+    select count(*), json_arrayagg(json_object(
+               'OWNER' value q.sequence_owner, 'NAME' value q.sequence_name,
+               'VALUE' value q.last_number, 'INCREMENT' value q.increment_by,
+               'MIN' value q.min_value, 'MAX' value q.max_value,
+               'CACHE' value q.cache_size, 'CYCLE' value q.cycle_flag,
+               'SCALE' value q.scale_flag, 'SHARD' value q.sharded_flag,
+               'SESSION' value q.session_flag, 'GENERATED' value o.generated,
+               'MAINTAINED' value o.oracle_maintained, 'OBJECT_ID' value o.object_id
+               returning clob) returning clob)
+      into l_rows, :target_json
+      from dba_sequences q
+      join json_table(:owners_json, '$[*]' columns (
+          username varchar2(128) path '$')) u on u.username = q.sequence_owner
+      left join dba_objects o
+        on o.owner = q.sequence_owner and o.object_name = q.sequence_name
+       and o.object_type = 'SEQUENCE' and o.subobject_name is null;
+    -- TARGET_INVENTORY_END
+    if :target_json is null then :target_json := '[]'; end if;
+    dbms_output.put_line('-- Target snapshot complete: ' || l_rows || ' sequences.');
+end;
+/
+
+prompt -- [3/5] Check source feature columns (three no-row probes; 11g compatible).
+declare
+    c_link constant varchar2(128) := upper('&&source_link');
+    function source_flag(p_column varchar2) return varchar2 is
+        l_probe number;
+    begin
+        execute immediate 'select count(q.' || p_column ||
+            ') from dba_sequences@' || c_link || ' q where 1 = 0' into l_probe;
+        dbms_output.put_line('-- Source ' || p_column || ': present.');
+        return 'q.' || p_column;
+    exception
+        when others then
+            if sqlcode = -904 then
+                dbms_output.put_line('-- Source ' || p_column || ': absent; using N (legacy source).');
+                return '''N''';
+            end if;
+            raise;
+    end;
+begin
+    :scale_expr := source_flag('SCALE_FLAG');
+    :shard_expr := source_flag('SHARDED_FLAG');
+    :session_expr := source_flag('SESSION_FLAG');
+end;
+/
+
+prompt -- [4/5] Read source sequence metadata once over the link, filtered by eligible owners.
+prompt -- This stage includes network transfer; there are no per-sequence link queries.
+declare
+    type source_row is record (
+        owner_name varchar2(128), sequence_name varchar2(128),
+        last_number number, increment_by number, min_value number, max_value number,
+        cache_size number, cycle_flag varchar2(1), scale_flag varchar2(1),
+        sharded_flag varchar2(1), session_flag varchar2(1)
+    );
+    type source_rows is table of source_row;
+    l_rows source_rows;
+    l_sql clob;
+    l_filter clob;
+    l_owner_count pls_integer := 0;
+    l_snapshot json_array_t := json_array_t();
+    l_item json_object_t;
+    procedure append_filter(p_text varchar2) is
+    begin
+        dbms_lob.writeappend(l_filter, length(p_text), p_text);
+    end;
+begin
+    -- Build literal owner predicates locally. 11g IN lists allow 1000 entries;
+    -- split larger owner sets into OR groups, still in ONE remote query.
+    -- Quoting is required for names containing apostrophes; values come from
+    -- the target dictionary, not from unvalidated SQL fragments.
+    dbms_lob.createtemporary(l_filter, true);
+    for r in (select username from json_table(:owners_json, '$[*]' columns (
+        username varchar2(128) path '$'))) loop
+        if mod(l_owner_count, 1000) = 0 then
+            if l_owner_count > 0 then append_filter(') or '); end if;
+            append_filter('q.sequence_owner in (');
+        else
+            append_filter(',');
+        end if;
+        append_filter('''' || replace(r.username, '''', '''''') || '''');
+        l_owner_count := l_owner_count + 1;
+    end loop;
+    if l_owner_count = 0 then
+        append_filter('1 = 0');
+    else
+        append_filter(')');
+    end if;
+    l_sql := q'~
+        select q.sequence_owner, q.sequence_name, q.last_number, q.increment_by,
+               q.min_value, q.max_value, q.cache_size, q.cycle_flag,
+               #SOURCE_SCALE_FLAG# scale_flag, #SOURCE_SHARDED_FLAG# sharded_flag,
+               #SOURCE_SESSION_FLAG# session_flag
+          from dba_sequences@#SOURCE_LINK# q
+         where (#OWNER_FILTER#)
+    ~';
+    l_sql := replace(l_sql, '#SOURCE_SCALE_FLAG#', :scale_expr);
+    l_sql := replace(l_sql, '#SOURCE_SHARDED_FLAG#', :shard_expr);
+    l_sql := replace(l_sql, '#SOURCE_SESSION_FLAG#', :session_expr);
+    l_sql := replace(l_sql, '#OWNER_FILTER#', l_filter);
+    l_sql := replace(l_sql, '#SOURCE_LINK#', upper('&&source_link'));
+    execute immediate l_sql bulk collect into l_rows;
+    -- This loop only serializes the already-fetched snapshot in local memory.
+    -- It executes no SELECT, DDL, NEXTVAL, or remote call.
+    for i in 1 .. l_rows.count loop
+        l_item := json_object_t();
+        l_item.put('OWNER', l_rows(i).owner_name);
+        l_item.put('NAME', l_rows(i).sequence_name);
+        l_item.put('VALUE', l_rows(i).last_number);
+        l_item.put('INCREMENT', l_rows(i).increment_by);
+        l_item.put('MIN', l_rows(i).min_value);
+        l_item.put('MAX', l_rows(i).max_value);
+        l_item.put('CACHE', l_rows(i).cache_size);
+        l_item.put('CYCLE', l_rows(i).cycle_flag);
+        l_item.put('SCALE', l_rows(i).scale_flag);
+        l_item.put('SHARD', l_rows(i).sharded_flag);
+        l_item.put('SESSION', l_rows(i).session_flag);
+        l_snapshot.append(l_item);
+    end loop;
+    :source_json := l_snapshot.to_clob();
+    dbms_output.put_line('-- Source snapshot complete: ' || l_rows.count || ' sequences.');
+    dbms_output.put_line('-- Remote work: 3 feature probes + 1 filtered inventory query, independent of sequence count.');
+    dbms_lob.freetemporary(l_filter);
+end;
+/
+
+prompt -- [5/5] Compare snapshots locally and print status / planned SQL for every sequence.
+prompt -- No ALTER is executed. No AFTER query is needed because the database is unchanged.
+set timing off
+column output_line format a32767
+column total_value new_value total_seq noprint
+column generated_value new_value generated_count noprint
+column skipped_value new_value skipped_count noprint
+column exit_value new_value final_exit noprint
+define total_seq = 0
+define generated_count = 0
+define skipped_count = 0
+define final_exit = 0
+spool &&run_dir/plan.sql
+select case when :generate_mode = 'Y'
+    then '-- GENERATED SQL ONLY: these ALTER statements have NOT been executed.'
+    else '-- READ-ONLY STATUS REPORT.' end output_line from dual;
+select '-- Target: ' || sys_context('USERENV', 'DB_NAME') || '; service: ' ||
+    sys_context('USERENV', 'SERVICE_NAME') || '; generated: ' ||
+    to_char(systimestamp, 'YYYY-MM-DD HH24:MI:SS TZH:TZM') output_line from dual;
+prompt -- Values are LAST_NUMBER cache boundaries, not last issued values.
+prompt -- Owner scope: target DBA_USERS.ORACLE_MAINTAINED=N; matching owner/name on source.
+select '-- ' || case when :generate_mode = 'Y' then
+    'Stop consumers on BOTH databases / ALL RAC instances, regenerate a fresh plan, review, then execute manually on this target.'
+    else 'Use -align [-output FILE] to generate SQL without executing it.' end output_line from dual;
+select '-- ' || case when :generate_mode = 'Y' then
+    'Each eligible sequence gets a restart, including equal/ahead, to discard potentially lower unused cached values.'
+    else 'PHASE,OWNER,NAME,TARGET_LAST_NUMBER,SOURCE_LAST_NUMBER,TARGET_CACHE_SIZE,SOURCE_CACHE_SIZE,STATUS,DETAILS'
+    end output_line from dual;
+select 'SET DEFINE OFF' || chr(10) || 'SET SQLBLANKLINES ON' || chr(10) ||
+       'SET CMDSEP OFF' || chr(10) || 'SET ECHO ON' || chr(10) || 'SET TIMING ON' || chr(10) ||
+       'WHENEVER SQLERROR EXIT 1 ROLLBACK' || chr(10) ||
+       'WHENEVER OSERROR EXIT 1 ROLLBACK' output_line
+  from dual where :generate_mode = 'Y';
+prompt -- Restart DDL commits individually; there is no batch rollback. Regenerate if the snapshot becomes stale.
+
+-- COMPARISON_BEGIN
+with target_rows as (
+    select j.*, 1 present from json_table(:target_json, '$[*]' error on error columns (
+        owner_name varchar2(128) path '$.OWNER', sequence_name varchar2(128) path '$.NAME',
+        val number path '$.VALUE', increment_by number path '$.INCREMENT',
+        min_value number path '$.MIN', max_value number path '$.MAX',
+        cache_size number path '$.CACHE', cycle_flag varchar2(1) path '$.CYCLE',
+        scale_flag varchar2(1) path '$.SCALE', sharded_flag varchar2(1) path '$.SHARD',
+        session_flag varchar2(1) path '$.SESSION', generated varchar2(1) path '$.GENERATED',
+        maintained varchar2(1) path '$.MAINTAINED', object_id number path '$.OBJECT_ID'
+    )) j
+), source_rows as (
+    select j.*, 1 present from json_table(:source_json, '$[*]' error on error columns (
+        owner_name varchar2(128) path '$.OWNER', sequence_name varchar2(128) path '$.NAME',
+        val number path '$.VALUE', increment_by number path '$.INCREMENT',
+        min_value number path '$.MIN', max_value number path '$.MAX',
+        cache_size number path '$.CACHE', cycle_flag varchar2(1) path '$.CYCLE',
+        scale_flag varchar2(1) path '$.SCALE', sharded_flag varchar2(1) path '$.SHARD',
+        session_flag varchar2(1) path '$.SESSION'
+    )) j
+), paired as (
+    select coalesce(t.owner_name, s.owner_name) owner_name,
+           coalesce(t.sequence_name, s.sequence_name) sequence_name,
+           t.present t_present, s.present s_present,
+           t.val t_value, s.val s_value,
+           t.increment_by t_increment, s.increment_by s_increment,
+           t.min_value t_min, s.min_value s_min, t.max_value t_max, s.max_value s_max,
+           t.cache_size t_cache, s.cache_size s_cache,
+           t.cycle_flag t_cycle, s.cycle_flag s_cycle,
+           t.scale_flag t_scale, s.scale_flag s_scale,
+           t.sharded_flag t_shard, s.sharded_flag s_shard,
+           t.session_flag t_session, s.session_flag s_session,
+           t.generated t_generated, t.maintained t_maintained, t.object_id t_object_id
+      from target_rows t full outer join source_rows s
+        on t.owner_name = s.owner_name and t.sequence_name = s.sequence_name
+), classified as (
+    select p.*,
+        case when t_increment > 0 then greatest(t_value, s_value)
+             else least(t_value, s_value) end restart_value,
+        case when t_present is null then 'missing_target'
+             when s_present is null then 'missing_source'
+             when t_session = 'Y' or s_session = 'Y' or t_scale = 'Y' or s_scale = 'Y'
+               or t_shard = 'Y' or s_shard = 'Y' or t_cycle = 'Y' or s_cycle = 'Y' then 'unsupported'
+             when t_increment <> s_increment then 'incompatible'
+             when t_value is null or s_value is null then 'unavailable'
+             when t_value = s_value then 'equal'
+             when (t_increment > 0 and t_value < s_value)
+               or (t_increment < 0 and t_value > s_value) then 'lagging'
+             else 'ahead' end status
+      from paired p
+), planned as (
+    select c.*,
+        case when t_present is null then 'No target sequence; not created'
+             when s_present is null then 'No source sequence for eligible target user'
+             when t_session = 'Y' or s_session = 'Y' then 'Session sequence: LAST_NUMBER is not meaningful'
+             when t_scale = 'Y' or s_scale = 'Y' or t_shard = 'Y' or s_shard = 'Y'
+                  then 'Scalable/sharded sequence: not a comparable global counter'
+             when t_cycle = 'Y' or s_cycle = 'Y' then 'Cycling sequence: cycle position is unknown'
+             when t_increment <> s_increment then 'Different INCREMENT BY definitions'
+             when t_min <> s_min or t_max <> s_max then 'Different MINVALUE/MAXVALUE definitions'
+             when t_generated = 'Y' then 'System-generated/identity sequence; cannot ALTER SEQUENCE'
+             when t_maintained = 'Y' then 'Oracle-maintained object'
+             when t_object_id is null then 'Target object metadata unavailable'
+             when t_value is null or s_value is null then 'LAST_NUMBER unavailable'
+             when restart_value < t_min or restart_value > t_max then 'Restart boundary outside bounds (possibly exhausted)'
+             when instr(owner_name, chr(10)) > 0 or instr(owner_name, chr(13)) > 0
+               or instr(sequence_name, chr(10)) > 0 or instr(sequence_name, chr(13)) > 0
+                  then 'Identifier contains a newline; manual review required'
+             else null end issue,
+        '"' || replace(owner_name, '"', '""') || '"."' ||
+               replace(sequence_name, '"', '""') || '"' quoted_name,
+        row_number() over (order by owner_name, sequence_name) seq_no,
+        count(*) over () total
+      from classified c
+), display_rows as (
+    select p.*,
+        replace(replace(replace(quoted_name, chr(13), '\r'), chr(10), '\n'), chr(9), '\t') display_name,
+        to_char(t_value, 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,''') target_text,
+        to_char(s_value, 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,''') source_text,
+        to_char(restart_value, 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,''') restart_text
+      from planned p
+)
+select case when :generate_mode = 'Y' then
+        '-- [' || seq_no || '/' || total || '] ' || display_name ||
+        ' | target=' || target_text || ' | source=' || source_text || ' | status=' || status ||
+        chr(10) || case when issue is not null then '-- SKIPPED: ' || issue else
+            '-- PLANNED: restart at ' || restart_text || case status
+                when 'lagging' then ' (source boundary is farther along).'
+                when 'ahead' then ' (keep target boundary and discard unused cached values).'
+                else ' (equal stored boundaries; discard unused cached values).' end || chr(10) ||
+            'PROMPT [' || seq_no || '/' || total || '] ' || display_name || ' -> restart at ' || restart_text || chr(10) ||
+            'ALTER SEQUENCE ' || quoted_name || ' RESTART START WITH ' || restart_text || ';' end
+       else replace(replace(replace(
+            'REPORT,"' || replace(owner_name, '"', '""') || '","' ||
+            replace(sequence_name, '"', '""') || '",' || target_text || ',' || source_text || ',' ||
+            to_char(t_cache, 'TM9') || ',' || to_char(s_cache, 'TM9') || ',"' || status || '","' || issue || '"',
+            chr(13), '\r'), chr(10), '\n'), chr(9), '\t') end output_line,
+       to_char(total, 'FM9999999990') total_value,
+       to_char(sum(case when :generate_mode = 'Y' and issue is null then 1 else 0 end) over (), 'FM9999999990') generated_value,
+       to_char(sum(case when issue is not null then 1 else 0 end) over (), 'FM9999999990') skipped_value,
+       case when sum(case when issue is not null then 1 else 0 end) over () > 0 then '3' else '0' end exit_value
+  from display_rows order by seq_no;
+-- COMPARISON_END
+
+prompt -- Summary: total=&total_seq, ALTER statements=&generated_count, skipped/issues=&skipped_count.
+prompt -- No ALTER statements were executed by this generator.
+prompt -- SEQUENCE REVIEW COMPLETE
+spool off
+exit &final_exit rollback
 SQL
 
 login="${db_user}@\"//${db_host}:${db_port}/${db_service}\""
@@ -445,10 +461,30 @@ if [[ $as_sysdba == Y ]]; then
 fi
 printf 'Connecting to %s:%s/%s as %s; enter the password at the SQL*Plus prompt.\n' \
     "$db_host" "$db_port" "$db_service" "$db_user"
+if [[ $do_align == Y ]]; then
+    printf 'Mode: GENERATE SQL ONLY. Planned output: %s\n' "$output_file"
+else
+    printf 'Mode: READ-ONLY REPORT.\n'
+fi
 # No password in argv, environment, or temporary file. -L prevents login retries.
 # Do not use -S: keep SQL*Plus's native password prompt visible.
 set +e
 "$sqlplus_bin" -L "$login" "@$run_dir/run.sql"
 sqlplus_status=$?
 set -e
+if [[ $do_align == Y && ( $sqlplus_status == 0 || $sqlplus_status == 3 ) ]]; then
+    if [[ ! -f $run_dir/plan.sql ]] || ! grep -Fxq -- '-- SEQUENCE REVIEW COMPLETE' "$run_dir/plan.sql"; then
+        printf 'ERROR: SQL generation did not finish; no output file was published.\n' >&2
+        exit 1
+    fi
+    if (set -o noclobber; cat "$run_dir/plan.sql" > "$output_file"); then
+        printf '\nGenerated SQL: %s\nNo ALTER statements were executed.\n' "$output_file"
+        if [[ $sqlplus_status == 3 ]]; then
+            printf 'Some sequences were skipped; inspect their reasons in the generated file.\n' >&2
+        fi
+    else
+        printf 'ERROR: Could not write output file: %s\n' "$output_file" >&2
+        exit 1
+    fi
+fi
 exit "$sqlplus_status"
